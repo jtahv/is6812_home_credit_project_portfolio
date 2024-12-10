@@ -1,0 +1,544 @@
+---
+title: "Home Credit EDA"
+author: "Joonas Tahvanainen"
+date: "2024-09-29"
+output:
+  html_document:
+    highlight: espresso
+    number_sections: no
+    toc: yes
+  editor_options:
+    chunk_output_type: console
+---
+
+
+# Loading the data 
+
+``` {r preparation, warning=FALSE, message=FALSE}
+library(tidyverse)
+application_test <- read_csv("application_test.csv")
+application_train <- read_csv("application_train.csv")
+pos_cash <- read_csv("POS_CASH_balance.csv")
+home_credit_columns_description <- read_csv("HomeCredit_columns_description.csv")
+bureau <- read_csv("bureau.csv")
+bureau_balance <- read_csv("bureau_balance.csv")
+credt_card_balance <- read_csv("credit_card_balance.csv")
+installment_payments <- read_csv("installments_payments.csv")
+previous_applications <- read_csv("previous_application.csv")
+
+
+```
+
+# Packages
+
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(skimr)
+library(summarytools)
+
+
+
+```
+
+
+
+# Exploring the target variable in application_{train|test}.csv
+
+``` {r}
+
+#Using skimr to skim the dataset
+skimmed<-skim(application_train)
+
+# Getting the majority class classifier
+skimmed %>% 
+  filter(skim_variable == "TARGET") %>%
+  pull(numeric.mean)
+
+```
+
+Based on the majority class classifier the probability of default is 8.07%. Based on that, the data is definitely unbalance as the defaults only make up a small portion of the overall data.
+
+
+``` {r, results= 'hide'}
+# looking at the structure of the data frame
+str(application_train)
+
+```
+# Data transformations
+
+I'm assuming that transforming some of these character and flag variables will make the analysis slightly easier.
+ 
+``` {r, results = 'hide'}
+
+# Converting every flag and character variable into a factor for easier analysis as well as the target variable
+at_clean <- application_train %>%
+  mutate(across(where(is.character), as.factor))
+
+at_clean <- at_clean %>%
+  mutate(across(matches("flag", ignore.case = TRUE), as.factor))
+
+at_clean <- at_clean %>%
+  mutate(across(c(REG_REGION_NOT_LIVE_REGION,
+                  REG_REGION_NOT_WORK_REGION,
+                  LIVE_REGION_NOT_WORK_REGION,
+                  REG_CITY_NOT_LIVE_CITY,
+                  REG_CITY_NOT_WORK_CITY,
+                  LIVE_CITY_NOT_WORK_CITY,
+                  TARGET), as.factor))
+
+str(at_clean)
+```
+
+``` {r, warning=FALSE, message=FALSE}
+library(janitor)
+
+# Cleaning the data set a little more to make all column names lower case
+at_clean <- at_clean %>% clean_names()
+
+```
+
+# Exploring variables
+
+```{r, results = 'hide'}
+# looking at the summaries of all numeric variables
+summary(at_clean[sapply(at_clean, is.numeric)])
+
+
+```
+
+A lot of these living situation variables seem unnecessary and there's a lot of NA's. My goal is to try to find out if they're really necessary, and hopefully remove them from the final data frame.
+``` {r, warning=FALSE}
+
+# Most of the living situation variables seem to have a lot of missing values. I want to find out if we really need them.
+
+# List of living situation variables
+living_situation_vars <- c(
+  "apartments_avg", "basementarea_avg", "years_beginexpluatation_avg", 
+  "years_build_avg", "commonarea_avg", "elevators_avg", 
+  "entrances_avg", "floorsmax_avg", "floorsmin_avg", 
+  "landarea_avg", "livingapartments_avg", "livingarea_avg", 
+  "nonlivingapartments_avg", "nonlivingarea_avg", "apartments_mode", 
+  "basementarea_mode", "years_beginexpluatation_mode", "years_build_mode", 
+  "commonarea_mode", "elevators_mode", "entrances_mode", 
+  "floorsmax_mode", "floorsmin_mode", "landarea_mode", 
+  "livingapartments_mode", "livingarea_mode", "nonlivingapartments_mode", 
+  "nonlivingarea_mode", "apartments_medi", "basementarea_medi", 
+  "years_beginexpluatation_medi", "years_build_medi", "commonarea_medi", 
+  "elevators_medi", "entrances_medi", "floorsmax_medi", 
+  "floorsmin_medi", "landarea_medi", "livingapartments_medi", 
+  "livingarea_medi", "nonlivingapartments_medi", "nonlivingarea_medi",  "totalarea_mode"
+)
+
+
+#Calculating summary statistics for the living variables
+at_clean %>%
+  group_by(target) %>%
+  summarise(across(all_of(living_situation_vars), 
+                   list(mean = mean, 
+                        sd = sd, 
+                        median = median), 
+                   na.rm = TRUE))
+
+```
+Based on the summaries, my thought is that those variables might be useless for further analysis and prediction. We'll do a simple linear model to explore more of the predictive power.
+
+```{r}
+
+# Based on the summary statistics, it's possible there's not much there. Let's run a simple linear model to see if there's any statistically significant predictive power in those variables 
+
+at_clean_lm <- at_clean %>%
+  mutate(target = as.numeric(as.character(target)))
+
+# Create the linear model
+lm_model <- lm(target ~ ., data = at_clean_lm %>% select(target, all_of(living_situation_vars)))
+
+# View the summary of the model
+summary(lm_model)
+
+
+```
+
+None of the variables representing the living situation of the applicant seem to be statistically significant in the linear model. We will remove all those variables that tell us something about the applicant's living situation.
+
+
+``` {r}
+
+# Based on what we saw, we're going to remove all living situation variables from the dataset:
+at_clean <- at_clean %>%
+  select(-all_of(living_situation_vars), 
+         -fondkapremont_mode, 
+         -housetype_mode, 
+         -wallsmaterial_mode, 
+         -emergencystate_mode)
+
+
+
+```
+
+Let's look at the data after removing those variables.
+
+``` {r, results = 'hide'}
+# Now we can get into exploring some of the relationships between the variables. For now, I'll just look at the means of each numeric variable across the levels of the target
+skim(at_clean)
+
+```
+
+```{r, results = 'hide'}
+
+summary(at_clean)
+
+```
+
+Out of the summary, days_employed stands out with very high max values. Let's see if we can do something about it. 
+
+
+``` {r}
+# pulling rows where days employed is positive to see what's going on
+at_clean %>%
+  filter(days_employed > 0) %>%
+  head(10)
+
+# looks like if days_employed is positive, it means that they are not currently working. the occupation is n/a and income type is not employment either.
+# let's convert all those positive values into 0, and negative values into positive for clarity
+at_clean <- at_clean %>%
+  mutate(days_employed = ifelse(days_employed > 0, 0, days_employed))
+
+at_clean <- at_clean %>%
+  mutate(days_employed = abs(days_employed))
+
+# making sure days_employed is now cleaned
+at_clean %>%
+  summarise(
+    mean_days_employed = mean(days_employed, na.rm = TRUE),
+    min_days_employed = min(days_employed, na.rm = TRUE),
+    max_days_employed = max(days_employed, na.rm = TRUE)
+  )
+
+```
+Also, looks like some of the occupation types might be missing. Let's see what's going on there. 
+
+``` {r, results = 'hide'}
+# Looking at why some occupation types might be missing
+at_clean %>%
+  filter(is.na(occupation_type)) %>%
+  sample_n(10) 
+
+# Looks like some may have just forgotten to put it in or something similar. We'll define unemployed and not listed based on days_employed
+at_clean <- at_clean %>%
+  mutate(occupation_type = case_when(
+    is.na(occupation_type) & days_employed > 0 ~ 'Not listed',
+    is.na(occupation_type) & days_employed == 0 ~ 'Unemployed',
+    TRUE ~ occupation_type  # Keep original value if not NA
+  )) %>% mutate(occupation_type = factor(occupation_type))
+
+skim(at_clean)
+
+```
+name_type_suite is the last categorical variable that has missing values. since there's only 1292, we'll remove all those rows
+
+``` {r}
+# name_type_suite is the last categorical variable that has missing values. since there's only 1292, we'll remove all those rows
+at_clean <- at_clean %>%
+  filter(!is.na(name_type_suite))
+
+```
+
+# Exploring and cleaning up numeric variables
+
+``` {r, results = 'hide'}
+
+# now that the categorical variables are clean, we'll look at the numeric ones
+summary(at_clean[sapply(at_clean, is.numeric)])
+
+
+```
+The credit scores, AKA ext_sources need to be cleaned up somehow:
+
+``` {r, results = 'hide'}
+
+# let's tackle the credit score issue first. 
+
+# first, I'm assuming all ext_sources stand for a credit bureau (experian, transunion, equifax). We're going to calculate the average score for each applicant.
+# if ext_sources are all n/a then the score will be 0
+at_clean <- at_clean %>%
+  mutate(avg_credit_score = rowMeans(
+    select(., ext_source_1, ext_source_2, ext_source_3), 
+    na.rm = TRUE
+  )) %>% 
+  mutate(avg_credit_score = ifelse(is.na(avg_credit_score), 0, avg_credit_score))
+
+# next we'll create flags for each credit scenario and also remove the old ext_sources
+at_clean <- at_clean %>%
+  mutate(
+    limited_credit_flag = case_when(
+      rowSums(!is.na(select(., ext_source_1, ext_source_2, ext_source_3))) %in% 1:2 ~ 1,
+      TRUE ~ 0
+    ),
+    no_credit_flag = case_when(
+      rowSums(is.na(select(., ext_source_1, ext_source_2, ext_source_3))) == 3 ~ 1,
+      TRUE ~ 0
+    ),
+    full_credit_flag = case_when(
+      rowSums(!is.na(select(., ext_source_1, ext_source_2, ext_source_3))) == 3 ~ 1,
+      TRUE ~ 0
+    )
+  ) %>%
+  mutate(
+    limited_credit_flag = factor(limited_credit_flag),
+    no_credit_flag = factor(no_credit_flag),
+    full_credit_flag = factor(full_credit_flag)
+  ) %>%
+  select(-ext_source_1, -ext_source_2, -ext_source_3)
+  
+
+# take a loo
+skim(at_clean)
+```
+Here we created an average credit score for each customer, and also put them into buckets (Created flags) based on their credit profile or whether they have scores or no.
+
+Next, we'll take a look at how the variables representing car ownership affect the dependent variable using some simple linear regression and boxplots
+
+``` {r}
+# running two very simple lm models to look at the relationship between the car ownership variables
+lm(as.numeric(target) ~ flag_own_car, data = at_clean) %>% summary()
+lm(as.numeric(target) ~ own_car_age, data = at_clean) %>% summary()
+
+# visualizing some of the relationship
+ggplot(at_clean, aes(x = flag_own_car, fill = target)) +
+  geom_bar(position = "fill") +  # Position fill gives proportions
+  labs(title = "Proportion of Target Variable by Car Ownership",
+       x = "Car Ownership",
+       y = "Proportion") +
+  theme_minimal()
+
+ggplot(at_clean %>% filter(flag_own_car == "Y"), aes(x = as.factor(target), y = own_car_age)) +
+  geom_boxplot(fill = "lightblue", outlier.color = "red") +
+  labs(title = "Own Car Age by Target Variable",
+       x = "Target Variable",
+       y = "Age of Car") +
+  theme_minimal()
+
+
+
+```
+Based on the results, it's possible that car ownership and the age of the car have an effect on the target variable.
+
+``` {r, results = 'hide'}
+# Based on the above analysis, it's possible the car variables will be important for modeling so we'll keep them for now, We'lll change the car age variable into a factor
+at_clean <- at_clean %>%
+  mutate(own_car_age = case_when(
+    is.na(own_car_age) ~ 'No car',
+    own_car_age >= 10 ~ '10+ years',
+    own_car_age < 10 ~ 'Less than 10 years'
+  )) %>%
+  mutate(own_car_age = as.factor(own_car_age))
+
+skim(at_clean)
+
+
+```
+
+There's 6 variables representing bureau inquiries. There are total of 41410 missing values, likely because they didn't have a specific credit report available. We'll see if it's possible to just convert those NA values to 0's.
+
+``` {r, results = 'hide'}
+# let's see what's going on with the n/a bureau inquiries
+at_clean %>%
+  filter(is.na(amt_req_credit_bureau_day))
+
+# seeing if they're related with the credit_flags
+at_clean %>%
+  filter(is.na(amt_req_credit_bureau_day)) %>%
+  summarise(
+    mean_limited_credit_flag = mean(as.numeric(as.character(limited_credit_flag)), na.rm = TRUE),
+    mean_no_credit_flag = mean(as.numeric(as.character(no_credit_flag)), na.rm = TRUE),
+    mean_full_credit_flag = mean(as.numeric(as.character(full_credit_flag)), na.rm = TRUE)
+  )
+
+# looks like the bureau inquiries are related with an applicant not having a credit score, probably meaning that the credit report is missing. We'll convert the missing values to zeros
+# since it means that they have never inquired for credit before
+at_clean <- at_clean %>%
+  mutate(
+    amt_req_credit_bureau_hour = replace_na(amt_req_credit_bureau_hour, 0),
+    amt_req_credit_bureau_day = replace_na(amt_req_credit_bureau_day, 0),
+    amt_req_credit_bureau_week = replace_na(amt_req_credit_bureau_week, 0),
+    amt_req_credit_bureau_mon = replace_na(amt_req_credit_bureau_mon, 0),
+    amt_req_credit_bureau_qrt = replace_na(amt_req_credit_bureau_qrt, 0),
+    amt_req_credit_bureau_year = replace_na(amt_req_credit_bureau_year, 0)
+  )
+
+
+skim(at_clean)
+```
+Cleaning up missing values for the observation variables. 
+
+``` {r, results = 'hide'}
+# the observation variables only have 1021 missing values, the annuity column has 12 missing values, and the phone column has 1 missing value. let's just get rid of those rows
+at_clean <- at_clean %>%
+  filter(
+    !is.na(amt_annuity) &
+    !is.na(obs_30_cnt_social_circle) &
+    !is.na(def_30_cnt_social_circle) &
+    !is.na(obs_60_cnt_social_circle) &
+    !is.na(def_60_cnt_social_circle) &
+    !is.na(days_last_phone_change)
+  )
+
+skim(at_clean)
+
+
+```
+
+
+``` {r, results = 'hide'}
+#now we have a dataset that is somewhat cleaned with no missing values. let's look at what else we can find
+
+summary(at_clean)
+str(at_clean)
+
+
+```
+
+
+
+
+
+
+
+
+# Aggregating and joining the bureau data frame to the cleaned application train
+
+
+``` {r}
+# cleaning up
+bureau <- clean_names(bureau)
+bureau$credit_active <- as.factor(bureau$credit_active)
+bureau$credit_type <- as.factor(bureau$credit_type)
+bureau <- clean_names(bureau)
+
+# taking a glance at the summary
+summary(bureau)
+
+# what are the different credit types in the data set 
+bureau %>% distinct(credit_type)
+
+
+```
+For the aggregation this time we'll keep this very simple. Once we get to the actual modelling, we could possibly create 10's or even 100's credit variables.
+
+``` {r}
+# creating 4 aggregated variables
+bureau_agg <- bureau %>%
+  group_by(sk_id_curr) %>%
+  summarise(
+    total_past_due = sum(amt_credit_sum_overdue, na.rm = TRUE),  # Sum of past due amounts
+    number_of_accounts = n(),  # Count of rows per sk_id_curr
+    number_of_paid_accounts = sum(credit_active == 'Closed' & (is.na(amt_credit_sum_debt) | amt_credit_sum_debt == 0)),  # Count of paid off accounts
+    ct_mortgage_auto = sum(credit_type %in% c('Car loan', 'Mortgage', 'Real estate loan'))  # Count of mortgage and auto-related credit types
+  )
+
+
+```
+
+
+Joining the aggreagated bureau data to at_clean
+
+``` {r}
+# join the data
+at_join <- at_clean %>%
+  left_join(bureau_agg, by = "sk_id_curr")
+
+
+# converting NA's to 0's
+at_join <- at_join %>%
+  mutate(
+    total_past_due = replace_na(total_past_due, 0),
+    number_of_accounts = replace_na(number_of_accounts, 0),
+    number_of_paid_accounts = replace_na(number_of_paid_accounts, 0),
+    ct_mortgage_auto = replace_na(ct_mortgage_auto, 0)
+  )
+
+
+```
+
+Looking at how the new credit variables may affect the target variable
+
+``` {r}
+# running a linear regression to look at the relationships, therefore target needs to go back to numeric
+at_join$target <- as.numeric(as.character(at_join$target))
+
+lm(target ~ total_past_due + number_of_accounts + number_of_paid_accounts + ct_mortgage_auto, 
+                   data = at_join) %>% summary()
+
+
+# creating a table to look at how the credit variables are distributed 
+at_table <- at_join %>%
+  group_by(target) %>%
+  summarise(
+    mean_total_past_due = mean(total_past_due, na.rm = TRUE),
+    mean_number_of_accounts = mean(number_of_accounts, na.rm = TRUE),
+    mean_paid_accounts = mean(number_of_paid_accounts, na.rm = TRUE),
+    mean_ct_mortgage_auto = mean(ct_mortgage_auto, na.rm = TRUE)
+  )
+
+at_table
+
+
+```
+As seen in the linear regression model and the table, having a higher amount of past due credit could play a big role in predicting default and having paid accounts and mortgage and auto history could positively impact loan preformance.
+
+
+# More simple analysis of different variables
+
+
+``` {r}
+# seeing if income has effect
+at_join %>%
+  group_by(target) %>%
+  summarise(avg_income = mean(amt_income_total, na.rm = TRUE))
+
+# looking at education type and if the probability of default is higher for some groups
+at_join %>%
+  group_by(name_education_type) %>%
+  summarise(probability_default = mean(as.numeric(target), na.rm = TRUE))
+
+# length of employment
+at_join %>%
+  group_by(target) %>%
+  summarise(
+    mean_days_employed = mean(days_employed, na.rm = TRUE),
+    median_days_employed = median(days_employed, na.rm = TRUE),
+    sd_days_employed = sd(days_employed, na.rm = TRUE),
+    count = n()
+  )
+
+# credit scores
+at_join %>%
+  group_by(target) %>%
+  summarise(
+    mean_avg_credit_score = mean(avg_credit_score, na.rm = TRUE),
+    median_avg_credit_score = median(avg_credit_score, na.rm = TRUE),
+    sd_avg_credit_score = sd(avg_credit_score, na.rm = TRUE),
+    count = n()
+  )
+
+# credit profile
+at_join %>%
+  group_by(full_credit_flag) %>%
+  summarise(
+    probability_of_default = mean(as.numeric(target), na.rm = TRUE),
+    count = n()
+  )
+
+```
+
+# Summary of findings
+
+To summarize, this EDA really just touched the surface. On an individual level there are definitely some variables that seem like they could have an effect on he target variable, such as education type, credit scores, length of employment, and also the applicant's credit profile. Based on my experience (I work for a for subprime auto lender that has a highly complex risk model that uses 1000's of credit variables) the credit variables need to be explored more. 
+
+In the main data there seemed to be some variables that are more unnecessary than useful, and even after the cleaning I did here, there might me some more that needs to be done. 
+
+I also haven't fully determined how to go about the target variable 'target'. The goal of the project is to be able to predict loan default so it might make sense to keep the target variable as a binary 'yes/no' variable, but I also like the idea of keeping it numeric to predict the probability of default. For the business perspective, if the model was to calculate the probability of default, it would give them more options as they could treat different probabilities of default differently (such as charge higher fees, rates, etc.) vs. if the model was only predicting yes/no, then every 'no' would be an automatic turn down. 
+
+There's many considerations here. I can't really grasp my head around the exact approach until we get to some modelling and testing. Based on the complexity of the data though, I would think that some sort of gradient boosting, neural network, or random forest type of model will be suitable for this project. 
+
+
