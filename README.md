@@ -1,6 +1,4 @@
 # IS 6812 Home Credit Default Risk portfolio
-This is a portfolio consisting of the coding work I completed for the Home Credit default prediction problem hosted by Kaggle.
-
 
 ## Getting started
 Home Credit hosted this competition on Kaggle (https://www.kaggle.com/competitions/home-credit-default-risk) back in 2018. Even after six years, it remains a great problem for students and others interested in data science to try solving to this day.
