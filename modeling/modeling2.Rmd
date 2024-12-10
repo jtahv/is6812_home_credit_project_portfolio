@@ -1,0 +1,728 @@
+
+
+```{r, warning=FALSE, message=FALSE, results='hide'}
+
+library(tidyverse)
+library(skimr)
+library(summarytools)
+library(janitor)
+library(caret)
+library(kernlab)
+library(rminer)
+library(randomForest)
+library(xgboost)
+library(pROC)
+library(doParallel)
+library(ROSE)
+
+# change names and csv names as needed
+application_train_xg <- read.csv("application_train.csv")
+application_test_xg <- read.csv("application_test.csv")
+bureau_xg <- read.csv("bureau.csv")
+
+```
+
+
+``` {r}
+
+# Factoring all character variables
+at_clean <- application_train_xg %>%
+  mutate(across(where(is.character), as.factor))
+
+#Factoring all 'flag' varaibles
+at_clean <- at_clean %>%
+  mutate(across(matches("flag", ignore.case = TRUE), as.factor))
+
+# Factoring all binary numeric variables
+at_clean <- at_clean %>%
+  mutate(across(c(REG_REGION_NOT_LIVE_REGION,
+                  REG_REGION_NOT_WORK_REGION,
+                  LIVE_REGION_NOT_WORK_REGION,
+                  REG_CITY_NOT_LIVE_CITY,
+                  REG_CITY_NOT_WORK_CITY,
+                  LIVE_CITY_NOT_WORK_CITY,
+                  TARGET), as.factor))
+
+# Converting column names to lowercase
+at_clean <- at_clean %>% clean_names()
+
+# Defining all living situation variables that are unnecessary for modeling
+living_situation_vars <- c(
+  "apartments_avg", "basementarea_avg", "years_beginexpluatation_avg",
+  "years_build_avg", "commonarea_avg", "elevators_avg",
+  "entrances_avg", "floorsmax_avg", "floorsmin_avg",
+  "landarea_avg", "livingapartments_avg", "livingarea_avg",
+  "nonlivingapartments_avg", "nonlivingarea_avg", "apartments_mode",
+  "basementarea_mode", "years_beginexpluatation_mode", "years_build_mode",
+  "commonarea_mode", "elevators_mode", "entrances_mode",
+  "floorsmax_mode", "floorsmin_mode", "landarea_mode",
+  "livingapartments_mode", "livingarea_mode", "nonlivingapartments_mode",
+  "nonlivingarea_mode", "apartments_medi", "basementarea_medi",
+  "years_beginexpluatation_medi", "years_build_medi", "commonarea_medi",
+  "elevators_medi", "entrances_medi", "floorsmax_medi",
+  "floorsmin_medi", "landarea_medi", "livingapartments_medi",
+  "livingarea_medi", "nonlivingapartments_medi", "nonlivingarea_medi",  "totalarea_mode"
+)
+
+# Removing all living situation variables and a few others not defined before
+at_clean <- at_clean %>%
+  select(-all_of(living_situation_vars),
+         -fondkapremont_mode,
+         -housetype_mode,
+         -wallsmaterial_mode,
+         -emergencystate_mode)
+
+# Fixing the issues with days employed variable
+at_clean <- at_clean %>%
+  mutate(days_employed = ifelse(days_employed > 0, 0, days_employed))
+
+at_clean <- at_clean %>%
+  mutate(days_employed = abs(days_employed))
+
+# Simplifying the Occupation type variable
+at_clean <- at_clean %>%
+  mutate(occupation_type = case_when(
+    is.na(occupation_type) & days_employed > 0 ~ 'Not listed',
+    is.na(occupation_type) & days_employed == 0 ~ 'Unemployed',
+    TRUE ~ occupation_type  # Keep original value if not NA
+  )) %>% mutate(occupation_type = factor(occupation_type))
+
+# Removing all rows where name_type_suite is n/a
+at_clean <- at_clean %>%
+  filter(!is.na(name_type_suite))
+
+# Combining credit scores to an average credit score
+at_clean <- at_clean %>%
+  mutate(avg_credit_score = rowMeans(
+    select(., ext_source_1, ext_source_2, ext_source_3),
+    na.rm = TRUE
+  )) %>%
+  mutate(avg_credit_score = ifelse(is.na(avg_credit_score), 0, avg_credit_score))
+
+# Creating credit flags based on how many bureau credit scores are available
+at_clean <- at_clean %>%
+  mutate(
+    limited_credit_flag = case_when(
+      rowSums(!is.na(select(., ext_source_1, ext_source_2, ext_source_3))) %in% 1:2 ~ 1,
+      TRUE ~ 0
+    ),
+    no_credit_flag = case_when(
+      rowSums(is.na(select(., ext_source_1, ext_source_2, ext_source_3))) == 3 ~ 1,
+      TRUE ~ 0
+    ),
+    full_credit_flag = case_when(
+      rowSums(!is.na(select(., ext_source_1, ext_source_2, ext_source_3))) == 3 ~ 1,
+      TRUE ~ 0
+    )
+  ) %>%
+  mutate(
+    limited_credit_flag = factor(limited_credit_flag),
+    no_credit_flag = factor(no_credit_flag),
+    full_credit_flag = factor(full_credit_flag)
+  ) %>%
+  select(-ext_source_1, -ext_source_2, -ext_source_3)
+
+# Simplifying the own car age variable
+at_clean <- at_clean %>%
+  mutate(own_car_age = case_when(
+    is.na(own_car_age) ~ 'No car',
+    own_car_age >= 10 ~ '10+ years',
+    own_car_age < 10 ~ 'Less than 10 years'
+  )) %>%
+  mutate(own_car_age = as.factor(own_car_age))
+
+# Replacing n/a's with 0
+at_clean <- at_clean %>%
+  mutate(
+    amt_req_credit_bureau_hour = replace_na(amt_req_credit_bureau_hour, 0),
+    amt_req_credit_bureau_day = replace_na(amt_req_credit_bureau_day, 0),
+    amt_req_credit_bureau_week = replace_na(amt_req_credit_bureau_week, 0),
+    amt_req_credit_bureau_mon = replace_na(amt_req_credit_bureau_mon, 0),
+    amt_req_credit_bureau_qrt = replace_na(amt_req_credit_bureau_qrt, 0),
+    amt_req_credit_bureau_year = replace_na(amt_req_credit_bureau_year, 0)
+  )
+
+# Removing all rows where the following variables are n/a
+at_clean <- at_clean %>%
+  filter(
+    !is.na(amt_annuity) &
+    !is.na(obs_30_cnt_social_circle) &
+    !is.na(def_30_cnt_social_circle) &
+    !is.na(obs_60_cnt_social_circle) &
+    !is.na(def_60_cnt_social_circle) &
+    !is.na(days_last_phone_change)
+  )
+
+```
+
+
+
+```{r}
+
+bureau <- clean_names(bureau_xg)
+bureau$credit_active <- as.factor(bureau$credit_active)
+bureau$credit_type <- as.factor(bureau$credit_type)
+bureau <- clean_names(bureau)
+
+bureau_agg <- bureau %>%
+  group_by(sk_id_curr) %>%
+  summarise(
+    total_past_due = sum(amt_credit_sum_overdue, na.rm = TRUE),  # Sum of past due amounts
+    number_of_accounts = n(),  # Count of rows per sk_id_curr
+    number_of_paid_accounts = sum(credit_active == 'Closed' & (is.na(amt_credit_sum_debt) | amt_credit_sum_debt == 0)),  # Count of paid off accounts
+    ct_mortgage_auto = sum(credit_type %in% c('Car loan', 'Mortgage', 'Real estate loan')),  # Count of mortgage and auto-related credit types
+    ct_chargoff_accts = sum(credit_active == 'Closed' & amt_credit_sum_debt > 0, na.rm = TRUE),  # Count of charge-off accounts
+    sum_chargoff_balance = sum(ifelse(credit_active == 'Closed' & amt_credit_sum_debt > 0, amt_credit_sum_debt, 0), na.rm = TRUE),  # Sum of charge-off balances
+    ct_paid_mortgage_auto = sum(credit_active == 'Closed' & (is.na(amt_credit_sum_debt) | amt_credit_sum_debt == 0) &
+                                credit_type %in% c('Car loan', 'Mortgage', 'Real estate loan'))  # Count of paid off mortgage/auto-related accounts
+  )
+
+```
+
+
+
+```{r}
+
+at_join <- at_clean %>%
+  left_join(bureau_agg, by = "sk_id_curr")
+
+
+# converting NA's to 0's
+at_join <- at_join %>%
+  mutate(
+    total_past_due = replace_na(total_past_due, 0),
+    number_of_accounts = replace_na(number_of_accounts, 0),
+    number_of_paid_accounts = replace_na(number_of_paid_accounts, 0),
+    ct_mortgage_auto = replace_na(ct_mortgage_auto, 0),
+    ct_chargoff_accts = replace_na(ct_chargoff_accts, 0),
+    sum_chargoff_balance = replace_na(sum_chargoff_balance, 0),
+    ct_paid_mortgage_auto = replace_na(ct_paid_mortgage_auto, 0)
+  )
+
+```
+
+
+```{r}
+
+#Remove all flag_document variables
+at_join <- at_join %>%
+  select(-starts_with("flag_document"))
+
+# Convert negative values to postiive
+at_join <- at_join %>%
+  mutate(
+    days_birth = abs(days_birth),
+    days_registration = abs(days_registration),
+    days_id_publish = abs(days_id_publish),
+    days_last_phone_change = abs(days_last_phone_change)
+  )
+
+# Create application type based on name_type_suite
+at_join <- at_join %>%
+  mutate(application_type = factor(ifelse(name_type_suite == "Unaccompanied", "Individual", "Co-applied"))) %>%
+  select(-name_type_suite, -organization_type)
+
+```
+
+You should be left with a clean data ready for modeling in "at_join"
+
+
+``` {r}
+
+#library(DataExplorer)
+#create_report(at_join, y = "target")
+
+
+```
+
+``` {r}
+at_join <- at_join %>%
+  mutate(occupation_type_simple = if_else(
+    occupation_type %in% c("Laborers", "Sales staff", "Drivers", "Security staff", 
+                           "Cooking staff", "Cleaning staff", "Low-skill Laborers", 
+                           "Waters/barmen staff"),
+    "unskilled", 
+    "skilled"
+  ))
+
+at_join$occupation_type_simple <- as.factor(at_join$occupation_type_simple)
+
+```
+
+
+
+``` {r}
+registerDoParallel(cores = 8)
+
+selected_features <- at_join[, c(
+  "flag_own_realty", 
+  "amt_income_total", 
+  "amt_credit", 
+  "days_employed",
+  "days_birth",
+  "name_education_type", 
+  "avg_credit_score", 
+  "full_credit_flag", 
+  "no_credit_flag", 
+  "total_past_due", 
+  "number_of_accounts", 
+  "number_of_paid_accounts", 
+  "ct_mortgage_auto", 
+  "ct_chargoff_accts", 
+  "sum_chargoff_balance", 
+  "ct_paid_mortgage_auto", 
+  "application_type",
+  "occupation_type_simple",
+  "live_city_not_work_city",
+  "reg_city_not_work_city",
+  "days_id_publish",
+  "target" 
+)]
+
+
+majority_class <- selected_features[selected_features$target == 0, ]
+minority_class <- selected_features[selected_features$target == 1, ]
+
+# undersampling the majority class to match the size of the minority class
+set.seed(123)
+majority_class_undersampled <- majority_class[sample(nrow(majority_class), nrow(minority_class)), ]
+
+# combining and shuffling the dataset
+balanced_data <- rbind(majority_class_undersampled, minority_class)
+balanced_data <- balanced_data[sample(nrow(balanced_data)), ]
+
+# train-test split (80% train, 20% test)
+train_index_balanced <- createDataPartition(balanced_data$target, p = 0.8, list = FALSE)
+train_data_balanced <- balanced_data[train_index_balanced, ]
+test_data_balanced <- balanced_data[-train_index_balanced, ]
+
+# apply dummy encoding to categorical variables
+dummy_vars_balanced <- dummyVars("~ .", data = train_data_balanced[, -ncol(train_data_balanced)], fullRank = TRUE)
+train_data_transformed_balanced <- predict(dummy_vars_balanced, newdata = train_data_balanced)
+test_data_transformed_balanced <- predict(dummy_vars_balanced, newdata = test_data_balanced)
+
+# prepare labels for XGBoost
+train_labels_balanced <- as.numeric(train_data_balanced$target) - 1  # Adjusted labels for XGBoost
+test_labels_balanced <- as.numeric(test_data_balanced$target) - 1
+
+train_labels_balanced <- factor(train_labels_balanced, levels = c(0, 1))
+levels(train_labels_balanced) <- make.names(levels(train_labels_balanced))
+
+test_labels_balanced <- factor(test_labels_balanced, levels = c(0, 1))
+levels(test_labels_balanced) <- make.names(levels(test_labels_balanced))
+
+
+# set up cross-validation and parameter grid
+train_control_balanced <- trainControl(
+  method = "cv",
+  number = 5,
+  summaryFunction = twoClassSummary,
+  classProbs = TRUE
+)
+
+# set up xgboost params
+param_grid_balanced <- expand.grid(
+  nrounds = seq(from = 200, to = 1500, by = 100),         # Number of boosting iterations
+  max_depth = c(2,3,4,5,6),          # Maximum depth of trees
+  eta = c(0.01, 0.025, 0.05, 0.1, 0.5),             # Learning rate
+  gamma = c(0,1,2),              # Minimum loss reduction for a split
+  colsample_bytree = c(0.5, 0.75, 1),   # Proportion of features to consider
+  min_child_weight = c(1,3,5),   # Minimum sum of instance weight (hessian) needed in a child
+  subsample = 1           # Proportion of training data to randomly sample for each tree
+)
+
+# train the XGBoost model
+xgb_model_balanced <- train(
+  x = train_data_transformed_balanced,
+  y = train_labels_balanced,  
+  method = "xgbTree",
+  trControl = train_control_balanced,
+  tuneGrid = param_grid_balanced,
+  verbose = TRUE,
+  metric = "ROC"
+)
+
+# predict on the test data
+xgb_predictions_balanced <- predict(xgb_model_balanced, newdata = test_data_transformed_balanced)
+xgb_predictions_class_balanced <- as.numeric(xgb_predictions_balanced) - 1  # Convert factor back to numeric (0/1)
+
+# evaluate performance with a confusion matrix
+conf_matrix_balanced <- confusionMatrix(as.factor(xgb_predictions_class_balanced), as.factor(test_data_balanced$target))
+
+print(conf_matrix_balanced)
+
+
+```
+
+``` {r}
+library(pROC)
+xgb_probabilities_balanced <- predict(xgb_model_balanced, newdata = test_data_transformed_balanced, type = "prob")
+
+positive_probs <- xgb_probabilities_balanced[, "X1"]
+
+roc_curve <- roc(test_data_balanced$target, positive_probs)
+
+# Plot the ROC curve
+plot(roc_curve, main = "ROC Curve for XGBoost Model", col = "#1c61b6", lwd = 2)
+
+auc(roc_curve)
+```
+
+``` {r}
+xgb_probabilities <- predict(xgb_model_balanced, newdata = test_data_transformed_balanced, type = "prob")
+
+custom_threshold <- 0.7
+xgb_predictions_custom <- ifelse(xgb_probabilities[, "X1"] > custom_threshold, 1, 0)
+
+confusionMatrix(
+  as.factor(xgb_predictions_custom),
+  as.factor(test_data_balanced$target)
+)
+
+```
+
+``` {r}
+
+
+xgb_model_balanced$bestTune
+
+
+```
+
+
+
+
+
+
+``` {r}
+
+
+# Factoring all character variables
+a_clean <- application_test_xg %>%
+  mutate(across(where(is.character), as.factor))
+
+#Factoring all 'flag' varaibles
+a_clean <- a_clean %>%
+  mutate(across(matches("flag", ignore.case = TRUE), as.factor))
+
+# Factoring all binary numeric variables
+a_clean <- a_clean %>%
+  mutate(across(c(REG_REGION_NOT_LIVE_REGION,
+                  REG_REGION_NOT_WORK_REGION,
+                  LIVE_REGION_NOT_WORK_REGION,
+                  REG_CITY_NOT_LIVE_CITY,
+                  REG_CITY_NOT_WORK_CITY,
+                  LIVE_CITY_NOT_WORK_CITY), as.factor))
+
+# Converting column names to lowercase
+a_clean <- a_clean %>% clean_names()
+
+# Defining all living situation variables that are unnecessary for modeling
+living_situation_vars <- c(
+  "apartments_avg", "basementarea_avg", "years_beginexpluatation_avg",
+  "years_build_avg", "commonarea_avg", "elevators_avg",
+  "entrances_avg", "floorsmax_avg", "floorsmin_avg",
+  "landarea_avg", "livingapartments_avg", "livingarea_avg",
+  "nonlivingapartments_avg", "nonlivingarea_avg", "apartments_mode",
+  "basementarea_mode", "years_beginexpluatation_mode", "years_build_mode",
+  "commonarea_mode", "elevators_mode", "entrances_mode",
+  "floorsmax_mode", "floorsmin_mode", "landarea_mode",
+  "livingapartments_mode", "livingarea_mode", "nonlivingapartments_mode",
+  "nonlivingarea_mode", "apartments_medi", "basementarea_medi",
+  "years_beginexpluatation_medi", "years_build_medi", "commonarea_medi",
+  "elevators_medi", "entrances_medi", "floorsmax_medi",
+  "floorsmin_medi", "landarea_medi", "livingapartments_medi",
+  "livingarea_medi", "nonlivingapartments_medi", "nonlivingarea_medi",  "totalarea_mode"
+)
+
+# Removing all living situation variables and a few others not defined before
+a_clean <- a_clean %>%
+  select(-all_of(living_situation_vars),
+         -fondkapremont_mode,
+         -housetype_mode,
+         -wallsmaterial_mode,
+         -emergencystate_mode)
+
+# Fixing the issues with days employed variable
+a_clean <- a_clean %>%
+  mutate(days_employed = ifelse(days_employed > 0, 0, days_employed))
+
+a_clean <- a_clean %>%
+  mutate(days_employed = abs(days_employed))
+
+# Simplifying the Occupation type variable
+a_clean <- a_clean %>%
+  mutate(occupation_type = case_when(
+    is.na(occupation_type) & days_employed > 0 ~ 'Not listed',
+    is.na(occupation_type) & days_employed == 0 ~ 'Unemployed',
+    TRUE ~ occupation_type  # Keep original value if not NA
+  )) %>% mutate(occupation_type = factor(occupation_type))
+
+# Removing all rows where name_type_suite is n/a
+a_clean <- a_clean %>%
+  mutate(name_type_suite = replace_na(name_type_suite, "Unaccompanied"))
+
+# Combining credit scores to an average credit score
+a_clean <- a_clean %>%
+  mutate(avg_credit_score = rowMeans(
+    select(., ext_source_1, ext_source_2, ext_source_3),
+    na.rm = TRUE
+  )) %>%
+  mutate(avg_credit_score = ifelse(is.na(avg_credit_score), 0, avg_credit_score))
+
+# Creating credit flags based on how many bureau credit scores are available
+a_clean <- a_clean %>%
+  mutate(
+    limited_credit_flag = case_when(
+      rowSums(!is.na(select(., ext_source_1, ext_source_2, ext_source_3))) %in% 1:2 ~ 1,
+      TRUE ~ 0
+    ),
+    no_credit_flag = case_when(
+      rowSums(is.na(select(., ext_source_1, ext_source_2, ext_source_3))) == 3 ~ 1,
+      TRUE ~ 0
+    ),
+    full_credit_flag = case_when(
+      rowSums(!is.na(select(., ext_source_1, ext_source_2, ext_source_3))) == 3 ~ 1,
+      TRUE ~ 0
+    )
+  ) %>%
+  mutate(
+    limited_credit_flag = factor(limited_credit_flag),
+    no_credit_flag = factor(no_credit_flag),
+    full_credit_flag = factor(full_credit_flag)
+  ) %>%
+  select(-ext_source_1, -ext_source_2, -ext_source_3)
+
+# Simplifying the own car age variable
+a_clean <- a_clean %>%
+  mutate(own_car_age = case_when(
+    is.na(own_car_age) ~ 'No car',
+    own_car_age >= 10 ~ '10+ years',
+    own_car_age < 10 ~ 'Less than 10 years'
+  )) %>%
+  mutate(own_car_age = as.factor(own_car_age))
+
+# Replacing n/a's with 0
+a_clean <- a_clean %>%
+  mutate(
+    amt_req_credit_bureau_hour = replace_na(amt_req_credit_bureau_hour, 0),
+    amt_req_credit_bureau_day = replace_na(amt_req_credit_bureau_day, 0),
+    amt_req_credit_bureau_week = replace_na(amt_req_credit_bureau_week, 0),
+    amt_req_credit_bureau_mon = replace_na(amt_req_credit_bureau_mon, 0),
+    amt_req_credit_bureau_qrt = replace_na(amt_req_credit_bureau_qrt, 0),
+    amt_req_credit_bureau_year = replace_na(amt_req_credit_bureau_year, 0)
+  )
+
+# Removing all rows where the following variables are n/a
+a_clean <- a_clean %>%
+  mutate(
+    amt_annuity = replace_na(amt_annuity, 0),
+    obs_30_cnt_social_circle = replace_na(obs_30_cnt_social_circle, 0),
+    def_30_cnt_social_circle = replace_na(def_30_cnt_social_circle, 0),
+    obs_60_cnt_social_circle = replace_na(obs_60_cnt_social_circle, 0),
+    def_60_cnt_social_circle = replace_na(def_60_cnt_social_circle, 0),
+    days_last_phone_change = replace_na(days_last_phone_change, 0)
+  )
+
+
+a_join <- a_clean %>%
+  left_join(bureau_agg, by = "sk_id_curr")
+
+
+# converting NA's to 0's
+a_join <- a_join %>%
+  mutate(
+    total_past_due = replace_na(total_past_due, 0),
+    number_of_accounts = replace_na(number_of_accounts, 0),
+    number_of_paid_accounts = replace_na(number_of_paid_accounts, 0),
+    ct_mortgage_auto = replace_na(ct_mortgage_auto, 0),
+    ct_chargoff_accts = replace_na(ct_chargoff_accts, 0),
+    sum_chargoff_balance = replace_na(sum_chargoff_balance, 0),
+    ct_paid_mortgage_auto = replace_na(ct_paid_mortgage_auto, 0)
+  )
+
+a_join <- a_join %>%
+  select(-starts_with("flag_document"))
+
+# Convert negative values to postiive
+a_join <- a_join %>%
+  mutate(
+    days_birth = abs(days_birth),
+    days_registration = abs(days_registration),
+    days_id_publish = abs(days_id_publish),
+    days_last_phone_change = abs(days_last_phone_change)
+  )
+
+# Create application type based on name_type_suite
+a_join <- a_join %>%
+  mutate(application_type = factor(ifelse(name_type_suite == "Unaccompanied", "Individual", "Co-applied"))) %>%
+  select(-name_type_suite, -organization_type)
+
+
+
+
+a_join <- a_join %>%
+  mutate(occupation_type_simple = if_else(
+    occupation_type %in% c("Laborers", "Sales staff", "Drivers", "Security staff", 
+                           "Cooking staff", "Cleaning staff", "Low-skill Laborers", 
+                           "Waters/barmen staff"),
+    "unskilled", 
+    "skilled"
+  ))
+
+
+a_join$occupation_type_simple <- as.factor(a_join$occupation_type_simple)
+
+
+```
+
+
+
+
+
+
+``` {r}
+
+a_join_transformed <- predict(dummy_vars_balanced, newdata = a_join)
+
+xgb_predictions_a_join <- predict(xgb_model_balanced, newdata = a_join_transformed)
+
+xgb_predictions_a_join_class <- as.numeric(xgb_predictions_a_join) - 1
+
+a_join$predictions <- xgb_predictions_a_join_class
+
+table(a_join$predictions)
+
+application_test_predictions <- a_join %>%
+  select(sk_id_curr, predictions)
+```
+
+``` {r}
+application_test_predictions <- application_test_predictions %>%
+  rename(TARGET = predictions)
+
+write.csv(application_test_predictions, file = "kaggle_submission.csv", row.names = FALSE)
+
+
+```
+
+``` {r}
+
+a_join_probabilities <- predict(xgb_model_balanced, newdata = a_join_transformed, type = "prob")
+
+test_predictions_custom <- ifelse(a_join_probabilities[, "X1"] > custom_threshold, 1, 0)
+
+a_join_custom <- a_join
+a_join_custom$predictions <- test_predictions_custom
+
+table(a_join_custom$predictions)
+
+application_test_predictions_custom <- a_join_custom %>%
+  select(sk_id_curr, predictions)
+
+application_test_predictions_custom <- application_test_predictions_custom %>%
+  rename(TARGET = predictions)
+
+write.csv(application_test_predictions_custom, file = "kaggle_submission2.csv", row.names = FALSE)
+```
+
+
+
+
+
+``` {r}
+
+set.seed(123)
+majority_class_undersampled2 <- majority_class[sample(nrow(majority_class), 2 * nrow(minority_class)), ]
+
+# Combine and shuffle the dataset
+balanced_data2 <- rbind(majority_class_undersampled2, minority_class)
+balanced_data2 <- balanced_data2[sample(nrow(balanced_data2)), ]
+
+# Train-test split (80% train, 20% test)
+train_index_balanced2 <- createDataPartition(balanced_data2$target, p = 0.8, list = FALSE)
+train_data_balanced2 <- balanced_data2[train_index_balanced2, ]
+test_data_balanced2 <- balanced_data2[-train_index_balanced2, ]
+
+# Apply dummy encoding to categorical variables
+dummy_vars_balanced2 <- dummyVars("~ .", data = train_data_balanced2[, -ncol(train_data_balanced2)], fullRank = TRUE)
+train_data_transformed_balanced2 <- predict(dummy_vars_balanced2, newdata = train_data_balanced2)
+test_data_transformed_balanced2 <- predict(dummy_vars_balanced2, newdata = test_data_balanced2)
+
+# Prepare labels for XGBoost
+train_labels_balanced2 <- as.numeric(train_data_balanced2$target) - 1  # Adjusted labels for XGBoost
+test_labels_balanced2 <- as.numeric(test_data_balanced2$target) - 1
+
+train_labels_balanced2 <- factor(train_labels_balanced2, levels = c(0, 1))
+levels(train_labels_balanced2) <- make.names(levels(train_labels_balanced2))
+
+test_labels_balanced2 <- factor(test_labels_balanced2, levels = c(0, 1))
+levels(test_labels_balanced2) <- make.names(levels(test_labels_balanced2))
+
+
+
+train_control_balanced2 <- trainControl(
+  method = "cv",
+  number = 3,
+  summaryFunction = twoClassSummary,
+  classProbs = TRUE
+)
+
+# set up xgboost params
+param_grid_balanced2 <- expand.grid(
+  nrounds = 700,         # Number of boosting iterations
+  max_depth = 4,          # Maximum depth of trees
+  eta = 0.025,             # Learning rate
+  gamma = 0,              # Minimum loss reduction for a split
+  colsample_bytree = 0.5,   # Proportion of features to consider
+  min_child_weight = 3,   # Minimum sum of instance weight (hessian) needed in a child
+  subsample = 1          # Proportion of training data to randomly sample for each tree
+)
+
+xgb_model2 <- train(
+  x = train_data_transformed_balanced2,
+  y = train_labels_balanced2,  
+  method = "xgbTree",
+  trControl = train_control_balanced2,
+  tuneGrid = param_grid_balanced2,
+  verbose = TRUE,
+  metric = "ROC"
+)
+
+
+# Predict on the test data
+xgb_probabilities2 <- predict(xgb_model2, newdata = test_data_transformed_balanced2, type = "prob")
+xgb_predictions2 <- ifelse(xgb_probabilities2[, "X1"] > 0.5, 1, 0)
+
+# Evaluate performance with a confusion matrix
+confusionMatrix(
+  as.factor(xgb_predictions2),
+  as.factor(test_data_balanced2$target)
+)
+
+
+
+
+```
+``` {r}
+a_join_probabilities2 <- predict(xgb_model2, newdata = a_join_transformed, type = "prob")
+
+test_predictions2 <- ifelse(a_join_probabilities2[, "X1"] > 0.5, 1, 0)
+
+a_join_custom2 <- a_join
+a_join_custom2$predictions <- test_predictions2
+
+table(a_join_custom2$predictions)
+
+application_test_predictions2 <- a_join_custom2 %>%
+  select(sk_id_curr, predictions)
+
+application_test_predictions2 <- application_test_predictions2 %>%
+  rename(TARGET = predictions)
+
+write.csv(application_test_predictions_custom, file = "kaggle_submission3.csv", row.names = FALSE)
+
+
+```
+
+
